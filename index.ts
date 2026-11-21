@@ -208,6 +208,17 @@ server.listen(PORT, () => {
     printLog('success', `Server listening on port ${PORT}`);
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// PHONE NOTIFICATION FIX
+// When a linked device (the bot) is marked "online", WhatsApp stops sending push
+// notifications to the owner's phone. So the bot must never announce itself as
+// online: markOnlineOnConnect is false below, and 'available' presence updates
+// are dropped in the sendPresenceUpdate wrapper.
+// Escape hatch: set ALLOW_ONLINE_PRESENCE=true in the environment to allow
+// 'available' presence updates again (e.g. if a plugin genuinely needs them).
+// ─────────────────────────────────────────────────────────────────────────────
+const BLOCK_ONLINE_PRESENCE = process.env.ALLOW_ONLINE_PRESENCE !== 'true';
+
 async function startQasimDev(): Promise<any> {
     try {
         const { version } = await fetchLatestBaileysVersion();
@@ -222,9 +233,6 @@ async function startQasimDev(): Promise<any> {
         };
         const msgRetryCounterCache = new NodeCache();
 
-        const ghostMode = await store.getSetting('global', 'stealthMode');
-        const isGhostActive = ghostMode && ghostMode.enabled;
-
         const QasimDev = makeWASocket({
             version,
             logger: pino({ level: 'silent' }),
@@ -233,7 +241,9 @@ async function startQasimDev(): Promise<any> {
                 creds: state.creds,
                 keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" })),
             },
-            markOnlineOnConnect: !isGhostActive,
+            // FIX: was `!isGhostActive`, which marked the bot online whenever stealth
+            // mode was off and silenced the owner's phone notifications.
+            markOnlineOnConnect: false,
             generateHighQualityLinkPreview: true,
             syncFullHistory: false,
             getMessage: async (key: any) => {
@@ -253,6 +263,9 @@ async function startQasimDev(): Promise<any> {
         const originalSendReceipt = QasimDev.sendReceipt;
 
         QasimDev.sendPresenceUpdate = async function (...args: any[]) {
+            // FIX: never mark the bot "online" (keeps phone notifications working)
+            if (BLOCK_ONLINE_PRESENCE && args[0] === 'available') return;
+
             const ghostMode = await store.getSetting('global', 'stealthMode');
             if (ghostMode && ghostMode.enabled) {
                 printLog('info', '👻 Blocked presence update (stealth mode)');
