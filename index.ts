@@ -219,6 +219,12 @@ server.listen(PORT, () => {
 // ─────────────────────────────────────────────────────────────────────────────
 const BLOCK_ONLINE_PRESENCE = process.env.ALLOW_ONLINE_PRESENCE !== 'true';
 
+// Safety net: if anything flips the bot online on its own (message activity, a plugin
+// timer, etc.), this puts it back offline within a minute. Override the interval with
+// OFFLINE_REASSERT_MS (milliseconds).
+const OFFLINE_REASSERT_MS = Number(process.env.OFFLINE_REASSERT_MS) || 60_000;
+let offlineTimer: NodeJS.Timeout | null = null;
+
 async function startQasimDev(): Promise<any> {
     try {
         const { version } = await fetchLatestBaileysVersion();
@@ -264,7 +270,11 @@ async function startQasimDev(): Promise<any> {
 
         QasimDev.sendPresenceUpdate = async function (...args: any[]) {
             // FIX: never mark the bot "online" (keeps phone notifications working)
-            if (BLOCK_ONLINE_PRESENCE && args[0] === 'available') return;
+            if (BLOCK_ONLINE_PRESENCE && args[0] === 'available') {
+                const caller = new Error().stack?.split('\n').slice(2, 5).join('\n');
+                printLog('warning', `Blocked 'available' presence. Called from:\n${caller}`);
+                return;
+            }
 
             const ghostMode = await store.getSetting('global', 'stealthMode');
             if (ghostMode && ghostMode.enabled) {
@@ -546,6 +556,23 @@ async function startQasimDev(): Promise<any> {
                     printLog('error', `Failed to start auto bio: ${e.message}`);
                 }
 
+                // FIX: re-assert "offline" on every (re)connect, after plugins have started,
+                // so phone notifications stay on. Uses the original function so the stealth
+                // wrapper can't swallow it.
+                const assertOffline = async (warnIfNoName = false) => {
+                    try {
+                        if (warnIfNoName && !QasimDev.user?.name) {
+                            printLog('warning', 'No profile name on this session yet, WhatsApp may ignore the offline presence update');
+                        }
+                        await originalSendPresenceUpdate.call(QasimDev, 'unavailable');
+                    } catch (e: any) {
+                        printLog('error', `Failed to set offline presence: ${e.message}`);
+                    }
+                };
+                await assertOffline(true);
+                if (offlineTimer) clearInterval(offlineTimer);
+                offlineTimer = setInterval(() => { assertOffline(); }, OFFLINE_REASSERT_MS);
+
                 const ghostMode = await store.getSetting('global', 'stealthMode');
                 if (ghostMode && ghostMode.enabled) {
                     printLog('info', '👻 STEALTH MODE ACTIVE');
@@ -587,6 +614,8 @@ async function startQasimDev(): Promise<any> {
             if (connection === 'close') {
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
                 const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== 401;
+                printLog('connection', `Connection closed (status ${statusCode ?? 'unknown'})`);
+                if (offlineTimer) { clearInterval(offlineTimer); offlineTimer = null; }
 
                 if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
                     try { rmSync(path.join(process.cwd(), 'session'), { recursive: true, force: true }); } catch (_e: any) { /* ignore */ }
